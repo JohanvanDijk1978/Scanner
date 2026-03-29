@@ -6,12 +6,12 @@ Detects coordinated accumulation by suspicious wallets on older pump.fun tokens.
 import asyncio
 import logging
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 
 import httpx
-from telegram import Bot
+from telegram import Bot, Update
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
     HELIUS_API_KEY,
@@ -40,6 +40,7 @@ PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 # In-memory state
 alerted_clusters: dict[str, float] = {}  # cluster_key -> last_alert_timestamp
 known_tokens: dict[str, float] = {}       # mint -> first_seen_timestamp
+BOT_START_TIME: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +61,11 @@ async def rpc_post(client: httpx.AsyncClient, method: str, params: list) -> dict
 
 
 async def get_program_accounts(client: httpx.AsyncClient) -> list[str]:
-    """Fetch all token mints created by pump.fun program via Helius enhanced API."""
-    url = f"https://api.helius.xyz/v0/addresses/{PUMP_FUN_PROGRAM}/transactions?api-key={HELIUS_API_KEY}&limit=100&type=CREATE"
+    """Fetch token mints created by pump.fun program via Helius enhanced API."""
+    url = (
+        f"https://api.helius.xyz/v0/addresses/{PUMP_FUN_PROGRAM}/transactions"
+        f"?api-key={HELIUS_API_KEY}&limit=100&type=CREATE"
+    )
     resp = await client.get(url, timeout=30)
     resp.raise_for_status()
     txs = resp.json()
@@ -69,8 +73,7 @@ async def get_program_accounts(client: httpx.AsyncClient) -> list[str]:
     now = time.time()
     for tx in txs:
         ts = tx.get("timestamp", 0)
-        age = now - ts
-        if age < TOKEN_MIN_AGE_SECONDS:
+        if (now - ts) < TOKEN_MIN_AGE_SECONDS:
             continue
         for account in tx.get("accountData", []):
             mint = account.get("account")
@@ -83,13 +86,11 @@ async def get_program_accounts(client: httpx.AsyncClient) -> list[str]:
 
 
 async def get_token_supply(client: httpx.AsyncClient, mint: str) -> int:
-    """Get total token supply."""
     result = await rpc_post(client, "getTokenSupply", [mint])
     return int(result.get("value", {}).get("amount", 0))
 
 
 async def get_recent_token_txs(client: httpx.AsyncClient, mint: str) -> list[dict]:
-    """Fetch recent transactions for a token mint via Helius."""
     url = (
         f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
         f"?api-key={HELIUS_API_KEY}&limit=50&type=SWAP"
@@ -100,45 +101,27 @@ async def get_recent_token_txs(client: httpx.AsyncClient, mint: str) -> list[dic
 
 
 async def get_wallet_info(client: httpx.AsyncClient, wallet: str) -> dict:
-    """Get wallet age and transaction count."""
-    # Get transaction history count
     sigs_result = await rpc_post(
         client,
         "getSignaturesForAddress",
         [wallet, {"limit": 1000}],
     )
     tx_count = len(sigs_result) if isinstance(sigs_result, list) else 0
-
-    # Get account creation (first tx) approximate age via account info
-    account_result = await rpc_post(client, "getAccountInfo", [wallet, {"encoding": "base58"}])
-    # Estimate wallet age from earliest signature if available
     age_days = None
     if isinstance(sigs_result, list) and sigs_result:
-        oldest = sigs_result[-1]
-        block_time = oldest.get("blockTime")
+        block_time = sigs_result[-1].get("blockTime")
         if block_time:
             age_days = (time.time() - block_time) / 86400
-
-    return {
-        "address": wallet,
-        "tx_count": tx_count,
-        "age_days": age_days,
-    }
+    return {"address": wallet, "tx_count": tx_count, "age_days": age_days}
 
 
 def is_suspicious_wallet(wallet_info: dict) -> bool:
-    """Return True if wallet looks dormant/fresh/low-activity."""
     tx_count = wallet_info.get("tx_count", 9999)
     age_days = wallet_info.get("age_days")
-
-    # Brand new wallet (very few txs)
     if tx_count <= MAX_WALLET_TX_COUNT:
         return True
-
-    # Dormant wallet (old but almost no activity)
     if age_days is not None and age_days > MAX_WALLET_AGE_DAYS and tx_count <= MAX_WALLET_TX_COUNT * 3:
         return True
-
     return False
 
 
@@ -147,7 +130,6 @@ def is_suspicious_wallet(wallet_info: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def extract_buys(txs: list[dict], mint: str) -> list[dict]:
-    """Extract buy events (wallet bought the token) from parsed Helius transactions."""
     buys = []
     for tx in txs:
         ts = tx.get("timestamp", 0)
@@ -167,19 +149,12 @@ def extract_buys(txs: list[dict], mint: str) -> list[dict]:
 
 
 def find_coordinated_clusters(buys: list[dict], total_supply: int) -> list[dict]:
-    """
-    Group buys into time windows and detect coordinated accumulation.
-    Returns clusters that meet all thresholds.
-    """
     if not buys or total_supply == 0:
         return []
 
-    # Sort by time
     buys_sorted = sorted(buys, key=lambda x: x["timestamp"])
-    now = time.time()
     clusters = []
 
-    # Sliding window grouping
     for i, anchor in enumerate(buys_sorted):
         window = [
             b for b in buys_sorted[i:]
@@ -188,7 +163,6 @@ def find_coordinated_clusters(buys: list[dict], total_supply: int) -> list[dict]
         if len(window) < MIN_COORDINATED_WALLETS:
             continue
 
-        # Deduplicate wallets in window
         seen = {}
         for b in window:
             w = b["wallet"]
@@ -200,12 +174,9 @@ def find_coordinated_clusters(buys: list[dict], total_supply: int) -> list[dict]
 
         amounts = [v["amount"] for v in seen.values()]
         min_amt, max_amt = min(amounts), max(amounts)
-
-        # Similar buy sizes check
         if min_amt == 0 or (max_amt / min_amt) > BUY_SIZE_RATIO_MAX:
             continue
 
-        # Total supply check
         total_bought = sum(amounts)
         pct = (total_bought / total_supply) * 100
         if pct < SUPPLY_THRESHOLD_PCT:
@@ -234,8 +205,6 @@ def cluster_key(mint: str, cluster: dict) -> str:
 async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: dict):
     now = time.time()
     key = cluster_key(mint, cluster)
-
-    # Cooldown check
     if key in alerted_clusters and (now - alerted_clusters[key]) < ALERT_COOLDOWN_SECONDS:
         return
     alerted_clusters[key] = now
@@ -249,7 +218,7 @@ async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: 
         "",
         f"🪙 Token: `{mint}`",
         f"🔗 [View on Pump.fun](https://pump.fun/{mint})",
-        f"",
+        "",
         f"📊 *{n} wallets* bought *{pct:.2f}% of supply* within {TIME_WINDOW_SECONDS // 60} min window",
         f"⏰ Window started: {window_start}",
         "",
@@ -264,23 +233,18 @@ async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: 
         age = info.get("age_days")
         age_str = f"{age:.0f}d old" if age is not None else "age unknown"
         individual_pct = (amt / cluster["total_bought"]) * pct
-
         label = "🆕 Fresh" if (info.get("tx_count", 9999) <= 5) else "💤 Dormant"
         lines.append(
             f"{label} [`{w[:6]}…{w[-4:]}`](https://solscan.io/account/{w}) "
             f"— {tx_count} txs, {age_str}, {individual_pct:.2f}% supply"
         )
 
-    lines += [
-        "",
-        f"[Full token on Solscan](https://solscan.io/token/{mint})",
-    ]
+    lines += ["", f"[Full token on Solscan](https://solscan.io/token/{mint})"]
 
-    msg = "\n".join(lines)
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
+            text="\n".join(lines),
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
@@ -290,87 +254,145 @@ async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: 
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Bot commands
 # ---------------------------------------------------------------------------
 
-async def scan_once(client: httpx.AsyncClient, bot: Bot):
-    log.info("Starting scan cycle...")
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/info — show current thresholds and live stats."""
+    uptime_secs = int(time.time() - BOT_START_TIME)
+    hours, remainder = divmod(uptime_secs, 3600)
+    minutes, seconds = divmod(remainder, 60)
 
-    try:
-        mints = await get_program_accounts(client)
-    except Exception as e:
-        log.error(f"Failed to fetch token list: {e}")
-        return
-
-    log.info(f"Scanning {len(mints)} tokens older than {TOKEN_MIN_AGE_SECONDS // 3600}h")
-
-    for mint in mints:
-        try:
-            supply = await get_token_supply(client, mint)
-            if supply == 0:
-                continue
-
-            txs = await get_recent_token_txs(client, mint)
-            buys = extract_buys(txs, mint)
-            clusters = find_coordinated_clusters(buys, supply)
-
-            if not clusters:
-                continue
-
-            log.info(f"Found {len(clusters)} cluster(s) for {mint}, checking wallets...")
-
-            for cluster in clusters:
-                # Fetch wallet info for all wallets in cluster
-                wallet_infos = {}
-                for entry in cluster["wallets"]:
-                    w = entry["wallet"]
-                    try:
-                        info = await get_wallet_info(client, w)
-                        wallet_infos[w] = info
-                    except Exception as e:
-                        log.warning(f"Could not fetch wallet info for {w}: {e}")
-                        wallet_infos[w] = {}
-
-                # All wallets in cluster must be suspicious
-                all_suspicious = all(
-                    is_suspicious_wallet(wallet_infos.get(e["wallet"], {}))
-                    for e in cluster["wallets"]
-                )
-                if not all_suspicious:
-                    continue
-
-                await send_telegram_alert(bot, mint, cluster, wallet_infos)
-
-            # Small delay per token to respect rate limits
-            await asyncio.sleep(0.5)
-
-        except Exception as e:
-            log.error(f"Error scanning mint {mint}: {e}")
-            continue
+    msg = (
+        "ℹ️ *Scanner Info*\n"
+        "\n"
+        "*Detection Thresholds*\n"
+        f"  Supply threshold: `{SUPPLY_THRESHOLD_PCT}%` of total supply\n"
+        f"  Time window: `{TIME_WINDOW_SECONDS // 60} min`\n"
+        f"  Min coordinated wallets: `{MIN_COORDINATED_WALLETS}`\n"
+        f"  Max buy size ratio: `{BUY_SIZE_RATIO_MAX}x`\n"
+        "\n"
+        "*Wallet Classification*\n"
+        f"  Max txs (fresh): `{MAX_WALLET_TX_COUNT}`\n"
+        f"  Dormant age threshold: `{MAX_WALLET_AGE_DAYS} days`\n"
+        "\n"
+        "*Token Filters*\n"
+        f"  Min token age: `{TOKEN_MIN_AGE_SECONDS // 3600}h`\n"
+        "\n"
+        "*Live Stats*\n"
+        f"  Poll interval: every `{POLL_INTERVAL_SECONDS}s`\n"
+        f"  Alert cooldown: `{ALERT_COOLDOWN_SECONDS // 3600}h` per cluster\n"
+        f"  Tokens seen: `{len(known_tokens)}`\n"
+        f"  Clusters alerted: `{len(alerted_clusters)}`\n"
+        f"  Uptime: `{hours}h {minutes}m {seconds}s`\n"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
-async def main():
-    log.info("🚀 Pump.fun Coordinated Wallet Scanner starting...")
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# ---------------------------------------------------------------------------
+# Scan loop
+# ---------------------------------------------------------------------------
 
-    # Send startup message
-    try:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text="✅ *Scanner online.* Watching for coordinated accumulation on pump.fun tokens older than 24h.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception as e:
-        log.error(f"Could not send startup message: {e}. Check TELEGRAM_CHAT_ID and BOT_TOKEN.")
-
+async def scan_loop(app: Application):
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                await scan_once(client, bot)
+                log.info("Starting scan cycle...")
+                mints = await get_program_accounts(client)
+                log.info(f"Scanning {len(mints)} tokens older than {TOKEN_MIN_AGE_SECONDS // 3600}h")
+
+                for mint in mints:
+                    try:
+                        supply = await get_token_supply(client, mint)
+                        if supply == 0:
+                            continue
+
+                        txs = await get_recent_token_txs(client, mint)
+                        buys = extract_buys(txs, mint)
+                        clusters = find_coordinated_clusters(buys, supply)
+
+                        if not clusters:
+                            continue
+
+                        log.info(f"Found {len(clusters)} cluster(s) for {mint}")
+
+                        for cluster in clusters:
+                            wallet_infos = {}
+                            for entry in cluster["wallets"]:
+                                w = entry["wallet"]
+                                try:
+                                    wallet_infos[w] = await get_wallet_info(client, w)
+                                except Exception as e:
+                                    log.warning(f"Wallet info failed for {w}: {e}")
+                                    wallet_infos[w] = {}
+
+                            all_suspicious = all(
+                                is_suspicious_wallet(wallet_infos.get(e["wallet"], {}))
+                                for e in cluster["wallets"]
+                            )
+                            if not all_suspicious:
+                                continue
+
+                            await send_telegram_alert(app.bot, mint, cluster, wallet_infos)
+
+                        await asyncio.sleep(0.5)
+
+                    except Exception as e:
+                        log.error(f"Error scanning {mint}: {e}")
+
             except Exception as e:
-                log.error(f"Unhandled error in scan cycle: {e}")
-            log.info(f"Sleeping {POLL_INTERVAL_SECONDS}s until next cycle...")
+                log.error(f"Scan cycle error: {e}")
+
+            log.info(f"Sleeping {POLL_INTERVAL_SECONDS}s...")
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+async def main():
+    global BOT_START_TIME
+    log.info("🚀 Pump.fun Coordinated Wallet Scanner starting...")
+
+    if not HELIUS_API_KEY or HELIUS_API_KEY == "YOUR_HELIUS_API_KEY":
+        raise RuntimeError("HELIUS_API_KEY env var is not set")
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN":
+        raise RuntimeError("TELEGRAM_BOT_TOKEN env var is not set")
+    if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
+        raise RuntimeError("TELEGRAM_CHAT_ID env var is not set")
+
+    log.info(f"Helius key: {HELIUS_API_KEY[:6]}…")
+    log.info(f"Telegram token: {TELEGRAM_BOT_TOKEN[:10]}…")
+    log.info(f"Chat ID: {TELEGRAM_CHAT_ID}")
+
+    BOT_START_TIME = time.time()
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("info", cmd_info))
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        try:
+            await app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    "✅ *Scanner online.*\n"
+                    "Watching for coordinated accumulation on pump.fun tokens older than 24h.\n\n"
+                    "Commands:\n"
+                    "/info — show current thresholds and stats"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            log.error(f"Startup message failed: {e}")
+
+        await scan_loop(app)
+
+        await app.updater.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
