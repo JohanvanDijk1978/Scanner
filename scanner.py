@@ -1,12 +1,28 @@
 """
 Pump.fun Coordinated Wallet Scanner
 Detects coordinated accumulation by suspicious wallets on older pump.fun tokens.
+
+Commands:
+  /info         — current thresholds + live stats
+  /status       — uptime, tokens scanned, last scan time
+  /threshold N  — set supply % trigger (e.g. /threshold 3)
+  /minwallets N — set min coordinated wallets (e.g. /minwallets 3)
+  /window N     — set time window in minutes (e.g. /window 10)
+  /dormantage N — set dormant wallet age threshold in days
+  /wallet ADDR  — profile a specific wallet
+  /token MINT   — show suspicious holders for a token
+  /cluster MINT — show all detected clusters for a token
+  /recent       — last 10 alerts fired
+  /stats        — detection totals and hit rate
 """
 
 import asyncio
+import json
 import logging
 import time
+from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from telegram import Bot, Update
@@ -37,18 +53,72 @@ log = logging.getLogger(__name__)
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# In-memory state
-alerted_clusters: dict[str, float] = {}  # cluster_key -> last_alert_timestamp
-known_tokens: dict[str, float] = {}       # mint -> first_seen_timestamp
+# ---------------------------------------------------------------------------
+# Runtime state — all mutable settings live here so commands can change them
+# ---------------------------------------------------------------------------
+state = {
+    "supply_threshold_pct": SUPPLY_THRESHOLD_PCT,
+    "time_window_seconds": TIME_WINDOW_SECONDS,
+    "min_coordinated_wallets": MIN_COORDINATED_WALLETS,
+    "buy_size_ratio_max": BUY_SIZE_RATIO_MAX,
+    "max_wallet_tx_count": MAX_WALLET_TX_COUNT,
+    "max_wallet_age_days": MAX_WALLET_AGE_DAYS,
+}
+
+STATE_FILE = Path("/app/state.json")  # persists on Railway volume; falls back gracefully
+
+alerted_clusters: dict[str, float] = {}   # cluster_key -> last_alert_timestamp
+known_tokens: dict[str, float] = {}        # mint -> first_seen_timestamp
+token_clusters: dict[str, list] = {}       # mint -> list of detected clusters
+recent_alerts: deque = deque(maxlen=10)    # last 10 alert dicts
+
 BOT_START_TIME: float = 0.0
+LAST_SCAN_TIME: float = 0.0
+TOTAL_TOKENS_SCANNED: int = 0
+TOTAL_CLUSTERS_FOUND: int = 0
+TOTAL_ALERTS_SENT: int = 0
+SCAN_CYCLES: int = 0
+
+# Shared httpx client (set in main)
+_http_client: httpx.AsyncClient | None = None
+
+
+# ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
+
+def load_state():
+    """Load persisted settings from disk, falling back to config defaults."""
+    global state
+    try:
+        if STATE_FILE.exists():
+            saved = json.loads(STATE_FILE.read_text())
+            # Only load keys that exist in state (ignore unknown/stale keys)
+            for k in state:
+                if k in saved:
+                    state[k] = saved[k]
+            log.info(f"Loaded persisted state from {STATE_FILE}")
+        else:
+            log.info("No persisted state found, using config defaults")
+    except Exception as e:
+        log.warning(f"Could not load state file: {e} — using defaults")
+
+
+def save_state():
+    """Write current mutable settings to disk."""
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        log.warning(f"Could not save state file: {e}")
 
 
 # ---------------------------------------------------------------------------
 # RPC helpers
 # ---------------------------------------------------------------------------
 
-async def rpc_post(client: httpx.AsyncClient, method: str, params: list) -> dict:
-    resp = await client.post(
+async def rpc_post(method: str, params: list) -> dict:
+    resp = await _http_client.post(
         HELIUS_RPC,
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
         timeout=20,
@@ -60,13 +130,12 @@ async def rpc_post(client: httpx.AsyncClient, method: str, params: list) -> dict
     return data.get("result", {})
 
 
-async def get_program_accounts(client: httpx.AsyncClient) -> list[str]:
-    """Fetch token mints created by pump.fun program via Helius enhanced API."""
+async def get_program_accounts() -> list[str]:
     url = (
         f"https://api.helius.xyz/v0/addresses/{PUMP_FUN_PROGRAM}/transactions"
         f"?api-key={HELIUS_API_KEY}&limit=100&type=CREATE"
     )
-    resp = await client.get(url, timeout=30)
+    resp = await _http_client.get(url, timeout=30)
     resp.raise_for_status()
     txs = resp.json()
     mints = []
@@ -85,44 +154,58 @@ async def get_program_accounts(client: httpx.AsyncClient) -> list[str]:
     return list(set(mints))
 
 
-async def get_token_supply(client: httpx.AsyncClient, mint: str) -> int:
-    result = await rpc_post(client, "getTokenSupply", [mint])
+async def get_token_supply(mint: str) -> int:
+    result = await rpc_post("getTokenSupply", [mint])
     return int(result.get("value", {}).get("amount", 0))
 
 
-async def get_recent_token_txs(client: httpx.AsyncClient, mint: str) -> list[dict]:
+async def get_recent_token_txs(mint: str) -> list[dict]:
     url = (
         f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
         f"?api-key={HELIUS_API_KEY}&limit=50&type=SWAP"
     )
-    resp = await client.get(url, timeout=20)
+    resp = await _http_client.get(url, timeout=20)
     resp.raise_for_status()
     return resp.json()
 
 
-async def get_wallet_info(client: httpx.AsyncClient, wallet: str) -> dict:
-    sigs_result = await rpc_post(
-        client,
-        "getSignaturesForAddress",
-        [wallet, {"limit": 1000}],
-    )
+async def get_wallet_info(wallet: str) -> dict:
+    sigs_result = await rpc_post("getSignaturesForAddress", [wallet, {"limit": 1000}])
     tx_count = len(sigs_result) if isinstance(sigs_result, list) else 0
     age_days = None
     if isinstance(sigs_result, list) and sigs_result:
         block_time = sigs_result[-1].get("blockTime")
         if block_time:
             age_days = (time.time() - block_time) / 86400
-    return {"address": wallet, "tx_count": tx_count, "age_days": age_days}
+    first_seen = sigs_result[-1].get("blockTime") if sigs_result else None
+    last_seen = sigs_result[0].get("blockTime") if sigs_result else None
+    return {
+        "address": wallet,
+        "tx_count": tx_count,
+        "age_days": age_days,
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+    }
 
 
 def is_suspicious_wallet(wallet_info: dict) -> bool:
     tx_count = wallet_info.get("tx_count", 9999)
     age_days = wallet_info.get("age_days")
-    if tx_count <= MAX_WALLET_TX_COUNT:
+    if tx_count <= state["max_wallet_tx_count"]:
         return True
-    if age_days is not None and age_days > MAX_WALLET_AGE_DAYS and tx_count <= MAX_WALLET_TX_COUNT * 3:
+    if age_days is not None and age_days > state["max_wallet_age_days"] and tx_count <= state["max_wallet_tx_count"] * 3:
         return True
     return False
+
+
+def wallet_label(wallet_info: dict) -> str:
+    tx_count = wallet_info.get("tx_count", 9999)
+    age_days = wallet_info.get("age_days")
+    if tx_count <= 5:
+        return "🆕 Fresh"
+    if age_days is not None and age_days > state["max_wallet_age_days"]:
+        return "💤 Dormant"
+    return "⚠️ Low-activity"
 
 
 # ---------------------------------------------------------------------------
@@ -152,15 +235,17 @@ def find_coordinated_clusters(buys: list[dict], total_supply: int) -> list[dict]
     if not buys or total_supply == 0:
         return []
 
+    tw = state["time_window_seconds"]
+    min_wallets = state["min_coordinated_wallets"]
+    ratio_max = state["buy_size_ratio_max"]
+    threshold_pct = state["supply_threshold_pct"]
+
     buys_sorted = sorted(buys, key=lambda x: x["timestamp"])
     clusters = []
 
     for i, anchor in enumerate(buys_sorted):
-        window = [
-            b for b in buys_sorted[i:]
-            if b["timestamp"] - anchor["timestamp"] <= TIME_WINDOW_SECONDS
-        ]
-        if len(window) < MIN_COORDINATED_WALLETS:
+        window = [b for b in buys_sorted[i:] if b["timestamp"] - anchor["timestamp"] <= tw]
+        if len(window) < min_wallets:
             continue
 
         seen = {}
@@ -169,17 +254,17 @@ def find_coordinated_clusters(buys: list[dict], total_supply: int) -> list[dict]
             if w not in seen or b["amount"] > seen[w]["amount"]:
                 seen[w] = b
 
-        if len(seen) < MIN_COORDINATED_WALLETS:
+        if len(seen) < min_wallets:
             continue
 
         amounts = [v["amount"] for v in seen.values()]
         min_amt, max_amt = min(amounts), max(amounts)
-        if min_amt == 0 or (max_amt / min_amt) > BUY_SIZE_RATIO_MAX:
+        if min_amt == 0 or (max_amt / min_amt) > ratio_max:
             continue
 
         total_bought = sum(amounts)
         pct = (total_bought / total_supply) * 100
-        if pct < SUPPLY_THRESHOLD_PCT:
+        if pct < threshold_pct:
             continue
 
         clusters.append({
@@ -187,7 +272,7 @@ def find_coordinated_clusters(buys: list[dict], total_supply: int) -> list[dict]
             "total_bought": total_bought,
             "supply_pct": pct,
             "window_start": anchor["timestamp"],
-            "window_end": anchor["timestamp"] + TIME_WINDOW_SECONDS,
+            "window_end": anchor["timestamp"] + tw,
         })
 
     return clusters
@@ -203,24 +288,27 @@ def cluster_key(mint: str, cluster: dict) -> str:
 
 
 async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: dict):
+    global TOTAL_ALERTS_SENT
     now = time.time()
     key = cluster_key(mint, cluster)
     if key in alerted_clusters and (now - alerted_clusters[key]) < ALERT_COOLDOWN_SECONDS:
         return
     alerted_clusters[key] = now
+    TOTAL_ALERTS_SENT += 1
 
     pct = cluster["supply_pct"]
     n = len(cluster["wallets"])
+    tw_min = state["time_window_seconds"] // 60
     window_start = datetime.fromtimestamp(cluster["window_start"], tz=timezone.utc).strftime("%H:%M:%S UTC")
 
     lines = [
         "🚨 *Coordinated Accumulation Detected*",
         "",
         f"🪙 Token: `{mint}`",
-        f"🔗 [View on Pump.fun](https://pump.fun/{mint})",
+        f"🔗 [Pump.fun](https://pump.fun/{mint}) | [Solscan](https://solscan.io/token/{mint})",
         "",
-        f"📊 *{n} wallets* bought *{pct:.2f}% of supply* within {TIME_WINDOW_SECONDS // 60} min window",
-        f"⏰ Window started: {window_start}",
+        f"📊 *{n} wallets* accumulated *{pct:.2f}% of supply* in {tw_min}min window",
+        f"⏰ Window: {window_start}",
         "",
         "*Wallet Breakdown:*",
     ]
@@ -233,18 +321,27 @@ async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: 
         age = info.get("age_days")
         age_str = f"{age:.0f}d old" if age is not None else "age unknown"
         individual_pct = (amt / cluster["total_bought"]) * pct
-        label = "🆕 Fresh" if (info.get("tx_count", 9999) <= 5) else "💤 Dormant"
+        label = wallet_label(info)
         lines.append(
             f"{label} [`{w[:6]}…{w[-4:]}`](https://solscan.io/account/{w}) "
             f"— {tx_count} txs, {age_str}, {individual_pct:.2f}% supply"
         )
 
-    lines += ["", f"[Full token on Solscan](https://solscan.io/token/{mint})"]
+    msg = "\n".join(lines)
+
+    # Store in recent alerts
+    recent_alerts.appendleft({
+        "mint": mint,
+        "pct": pct,
+        "n_wallets": n,
+        "timestamp": now,
+        "msg_preview": f"{n} wallets, {pct:.2f}% supply",
+    })
 
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="\n".join(lines),
+            text=msg,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
@@ -257,34 +354,321 @@ async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: 
 # Bot commands
 # ---------------------------------------------------------------------------
 
-async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/info — show current thresholds and live stats."""
-    uptime_secs = int(time.time() - BOT_START_TIME)
-    hours, remainder = divmod(uptime_secs, 3600)
-    minutes, seconds = divmod(remainder, 60)
+def fmt_uptime() -> str:
+    secs = int(time.time() - BOT_START_TIME)
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}h {m}m {s}s"
 
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/info — thresholds + live stats."""
+    s = state
     msg = (
         "ℹ️ *Scanner Info*\n"
         "\n"
         "*Detection Thresholds*\n"
-        f"  Supply threshold: `{SUPPLY_THRESHOLD_PCT}%` of total supply\n"
-        f"  Time window: `{TIME_WINDOW_SECONDS // 60} min`\n"
-        f"  Min coordinated wallets: `{MIN_COORDINATED_WALLETS}`\n"
-        f"  Max buy size ratio: `{BUY_SIZE_RATIO_MAX}x`\n"
+        f"  Supply threshold: `{s['supply_threshold_pct']}%`\n"
+        f"  Time window: `{s['time_window_seconds'] // 60} min`\n"
+        f"  Min coordinated wallets: `{s['min_coordinated_wallets']}`\n"
+        f"  Max buy size ratio: `{s['buy_size_ratio_max']}x`\n"
         "\n"
         "*Wallet Classification*\n"
-        f"  Max txs (fresh): `{MAX_WALLET_TX_COUNT}`\n"
-        f"  Dormant age threshold: `{MAX_WALLET_AGE_DAYS} days`\n"
+        f"  Max txs (fresh): `{s['max_wallet_tx_count']}`\n"
+        f"  Dormant age: `{s['max_wallet_age_days']} days`\n"
         "\n"
         "*Token Filters*\n"
         f"  Min token age: `{TOKEN_MIN_AGE_SECONDS // 3600}h`\n"
         "\n"
-        "*Live Stats*\n"
-        f"  Poll interval: every `{POLL_INTERVAL_SECONDS}s`\n"
-        f"  Alert cooldown: `{ALERT_COOLDOWN_SECONDS // 3600}h` per cluster\n"
+        "*Operational*\n"
+        f"  Poll interval: `{POLL_INTERVAL_SECONDS}s`\n"
+        f"  Alert cooldown: `{ALERT_COOLDOWN_SECONDS // 3600}h`\n"
         f"  Tokens seen: `{len(known_tokens)}`\n"
         f"  Clusters alerted: `{len(alerted_clusters)}`\n"
-        f"  Uptime: `{hours}h {minutes}m {seconds}s`\n"
+        f"  Uptime: `{fmt_uptime()}`\n"
+        "\n"
+        "*Commands*\n"
+        "/status /threshold /minwallets /window /dormantage\n"
+        "/wallet /token /cluster /recent /stats"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status — uptime, scan counts, last scan time."""
+    last_scan = (
+        datetime.fromtimestamp(LAST_SCAN_TIME, tz=timezone.utc).strftime("%H:%M:%S UTC")
+        if LAST_SCAN_TIME else "not yet"
+    )
+    msg = (
+        "📡 *Scanner Status*\n"
+        "\n"
+        f"  Uptime: `{fmt_uptime()}`\n"
+        f"  Last scan: `{last_scan}`\n"
+        f"  Scan cycles: `{SCAN_CYCLES}`\n"
+        f"  Tokens tracked: `{len(known_tokens)}`\n"
+        f"  Tokens scanned (total): `{TOTAL_TOKENS_SCANNED}`\n"
+        f"  Clusters found: `{TOTAL_CLUSTERS_FOUND}`\n"
+        f"  Alerts sent: `{TOTAL_ALERTS_SENT}`\n"
+        f"  Next scan in: ~`{POLL_INTERVAL_SECONDS}s`\n"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/threshold N — set supply % trigger."""
+    try:
+        val = float(context.args[0])
+        assert 0.1 <= val <= 100
+    except (IndexError, ValueError, AssertionError):
+        await update.message.reply_text("Usage: `/threshold 3` (0.1–100)", parse_mode=ParseMode.MARKDOWN)
+        return
+    old = state["supply_threshold_pct"]
+    state["supply_threshold_pct"] = val
+    save_state()
+    await update.message.reply_text(
+        f"✅ Supply threshold: `{old}%` → `{val}%`", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_minwallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/minwallets N — set minimum coordinated wallets."""
+    try:
+        val = int(context.args[0])
+        assert 2 <= val <= 20
+    except (IndexError, ValueError, AssertionError):
+        await update.message.reply_text("Usage: `/minwallets 3` (2–20)", parse_mode=ParseMode.MARKDOWN)
+        return
+    old = state["min_coordinated_wallets"]
+    state["min_coordinated_wallets"] = val
+    save_state()
+    await update.message.reply_text(
+        f"✅ Min wallets: `{old}` → `{val}`", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/window N — set time window in minutes."""
+    try:
+        val = int(context.args[0])
+        assert 1 <= val <= 60
+    except (IndexError, ValueError, AssertionError):
+        await update.message.reply_text("Usage: `/window 10` (1–60 minutes)", parse_mode=ParseMode.MARKDOWN)
+        return
+    old = state["time_window_seconds"] // 60
+    state["time_window_seconds"] = val * 60
+    save_state()
+    await update.message.reply_text(
+        f"✅ Time window: `{old} min` → `{val} min`", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_dormantage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dormantage N — set dormant wallet age threshold in days."""
+    try:
+        val = int(context.args[0])
+        assert 1 <= val <= 3650
+    except (IndexError, ValueError, AssertionError):
+        await update.message.reply_text("Usage: `/dormantage 60` (days)", parse_mode=ParseMode.MARKDOWN)
+        return
+    old = state["max_wallet_age_days"]
+    state["max_wallet_age_days"] = val
+    save_state()
+    await update.message.reply_text(
+        f"✅ Dormant age threshold: `{old} days` → `{val} days`", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/wallet ADDR — full profile of a wallet."""
+    if not context.args:
+        await update.message.reply_text("Usage: `/wallet <solana_address>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    addr = context.args[0].strip()
+    await update.message.reply_text(f"🔍 Looking up `{addr[:8]}…`", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        info = await get_wallet_info(addr)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error fetching wallet: {e}")
+        return
+
+    tx_count = info.get("tx_count", 0)
+    age_days = info.get("age_days")
+    first_seen = info.get("first_seen")
+    last_seen = info.get("last_seen")
+    suspicious = is_suspicious_wallet(info)
+    label = wallet_label(info)
+
+    age_str = f"{age_days:.0f} days" if age_days is not None else "unknown"
+    first_str = (
+        datetime.fromtimestamp(first_seen, tz=timezone.utc).strftime("%Y-%m-%d")
+        if first_seen else "unknown"
+    )
+    last_str = (
+        datetime.fromtimestamp(last_seen, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if last_seen else "unknown"
+    )
+
+    msg = (
+        f"👛 *Wallet Profile*\n"
+        f"\n"
+        f"  Address: [`{addr[:6]}…{addr[-4:]}`](https://solscan.io/account/{addr})\n"
+        f"  Classification: {label}\n"
+        f"  Suspicious: `{'Yes ⚠️' if suspicious else 'No ✅'}`\n"
+        f"\n"
+        f"  Total txs: `{tx_count}`\n"
+        f"  Wallet age: `{age_str}`\n"
+        f"  First tx: `{first_str}`\n"
+        f"  Last tx: `{last_str}`\n"
+        f"\n"
+        f"  [View on Solscan](https://solscan.io/account/{addr})"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+
+async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/token MINT — show suspicious wallets currently holding this token."""
+    if not context.args:
+        await update.message.reply_text("Usage: `/token <mint_address>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    mint = context.args[0].strip()
+    await update.message.reply_text(f"🔍 Scanning token `{mint[:8]}…`", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        supply = await get_token_supply(mint)
+        txs = await get_recent_token_txs(mint)
+        buys = extract_buys(txs, mint)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error fetching token data: {e}")
+        return
+
+    if not buys:
+        await update.message.reply_text("No recent buy activity found for this token.")
+        return
+
+    # Get unique buyers and check them
+    unique_wallets = list({b["wallet"] for b in buys})
+    suspicious_found = []
+
+    for w in unique_wallets[:20]:  # cap at 20 to avoid rate limit hammering
+        try:
+            info = await get_wallet_info(w)
+            if is_suspicious_wallet(info):
+                # Sum their total buys
+                total_bought = sum(b["amount"] for b in buys if b["wallet"] == w)
+                pct = (total_bought / supply * 100) if supply else 0
+                suspicious_found.append({"info": info, "wallet": w, "pct": pct})
+        except Exception:
+            continue
+
+    if not suspicious_found:
+        await update.message.reply_text(
+            f"✅ No suspicious wallets found in recent buyers for `{mint[:8]}…`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = [
+        f"🪙 *Suspicious holders of* `{mint[:8]}…`\n",
+        f"[Pump.fun](https://pump.fun/{mint}) | [Solscan](https://solscan.io/token/{mint})\n",
+        f"Found `{len(suspicious_found)}` suspicious wallet(s) among recent buyers:\n",
+    ]
+    for entry in suspicious_found:
+        w = entry["wallet"]
+        info = entry["info"]
+        pct = entry["pct"]
+        label = wallet_label(info)
+        age = info.get("age_days")
+        age_str = f"{age:.0f}d" if age is not None else "?"
+        lines.append(
+            f"{label} [`{w[:6]}…{w[-4:]}`](https://solscan.io/account/{w}) "
+            f"— {info['tx_count']} txs, {age_str} old, holds ~{pct:.2f}%"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+    )
+
+
+async def cmd_cluster(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cluster MINT — show all detected clusters for a token."""
+    if not context.args:
+        await update.message.reply_text("Usage: `/cluster <mint_address>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    mint = context.args[0].strip()
+    clusters = token_clusters.get(mint)
+
+    if not clusters:
+        await update.message.reply_text(
+            f"No clusters detected for `{mint[:8]}…` yet.\n"
+            f"Either the token hasn't triggered a detection or it hasn't been scanned.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = [f"🔬 *Clusters for* `{mint[:8]}…`\n"]
+    for i, c in enumerate(clusters, 1):
+        n = len(c["wallets"])
+        pct = c["supply_pct"]
+        ws = datetime.fromtimestamp(c["window_start"], tz=timezone.utc).strftime("%H:%M:%S UTC")
+        lines.append(f"*Cluster {i}* — {n} wallets, {pct:.2f}% supply, at {ws}")
+        for entry in c["wallets"]:
+            w = entry["wallet"]
+            lines.append(f"  • [`{w[:6]}…{w[-4:]}`](https://solscan.io/account/{w})")
+        lines.append("")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+    )
+
+
+async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/recent — last 10 alerts fired."""
+    if not recent_alerts:
+        await update.message.reply_text("No alerts fired yet this session.")
+        return
+
+    lines = ["📋 *Recent Alerts*\n"]
+    for i, a in enumerate(recent_alerts, 1):
+        ts = datetime.fromtimestamp(a["timestamp"], tz=timezone.utc).strftime("%m/%d %H:%M UTC")
+        mint = a["mint"]
+        lines.append(
+            f"`{i}.` [{mint[:8]}…](https://pump.fun/{mint}) — "
+            f"{a['n_wallets']} wallets, {a['pct']:.2f}% supply — {ts}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+    )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stats — detection totals and hit rate."""
+    hit_rate = (
+        f"{(TOTAL_CLUSTERS_FOUND / TOTAL_TOKENS_SCANNED * 100):.1f}%"
+        if TOTAL_TOKENS_SCANNED > 0 else "n/a"
+    )
+    alert_rate = (
+        f"{(TOTAL_ALERTS_SENT / TOTAL_CLUSTERS_FOUND * 100):.1f}%"
+        if TOTAL_CLUSTERS_FOUND > 0 else "n/a"
+    )
+    msg = (
+        "📊 *Detection Stats*\n"
+        "\n"
+        f"  Scan cycles run: `{SCAN_CYCLES}`\n"
+        f"  Tokens scanned: `{TOTAL_TOKENS_SCANNED}`\n"
+        f"  Clusters found: `{TOTAL_CLUSTERS_FOUND}`\n"
+        f"  Alerts sent: `{TOTAL_ALERTS_SENT}`\n"
+        f"\n"
+        f"  Cluster hit rate: `{hit_rate}` of tokens scanned\n"
+        f"  Alert conversion: `{alert_rate}` of clusters alerted\n"
+        f"  (Alerts < clusters when cluster is on cooldown)\n"
+        f"\n"
+        f"  Uptime: `{fmt_uptime()}`\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -294,57 +678,67 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def scan_loop(app: Application):
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                log.info("Starting scan cycle...")
-                mints = await get_program_accounts(client)
-                log.info(f"Scanning {len(mints)} tokens older than {TOKEN_MIN_AGE_SECONDS // 3600}h")
+    global LAST_SCAN_TIME, TOTAL_TOKENS_SCANNED, TOTAL_CLUSTERS_FOUND, SCAN_CYCLES
 
-                for mint in mints:
-                    try:
-                        supply = await get_token_supply(client, mint)
-                        if supply == 0:
+    while True:
+        try:
+            log.info("Starting scan cycle...")
+            mints = await get_program_accounts()
+            SCAN_CYCLES += 1
+            log.info(f"Scanning {len(mints)} tokens")
+
+            for mint in mints:
+                try:
+                    supply = await get_token_supply(mint)
+                    if supply == 0:
+                        continue
+
+                    txs = await get_recent_token_txs(mint)
+                    buys = extract_buys(txs, mint)
+                    clusters = find_coordinated_clusters(buys, supply)
+
+                    TOTAL_TOKENS_SCANNED += 1
+
+                    if not clusters:
+                        continue
+
+                    TOTAL_CLUSTERS_FOUND += len(clusters)
+                    log.info(f"Found {len(clusters)} cluster(s) for {mint}")
+
+                    # Store clusters for /cluster command
+                    token_clusters[mint] = clusters
+
+                    for cluster in clusters:
+                        wallet_infos = {}
+                        for entry in cluster["wallets"]:
+                            w = entry["wallet"]
+                            try:
+                                wallet_infos[w] = await get_wallet_info(w)
+                            except Exception as e:
+                                log.warning(f"Wallet info failed for {w}: {e}")
+                                wallet_infos[w] = {}
+
+                        all_suspicious = all(
+                            is_suspicious_wallet(wallet_infos.get(e["wallet"], {}))
+                            for e in cluster["wallets"]
+                        )
+                        if not all_suspicious:
                             continue
 
-                        txs = await get_recent_token_txs(client, mint)
-                        buys = extract_buys(txs, mint)
-                        clusters = find_coordinated_clusters(buys, supply)
+                        await send_telegram_alert(app.bot, mint, cluster, wallet_infos)
 
-                        if not clusters:
-                            continue
+                    await asyncio.sleep(0.5)
 
-                        log.info(f"Found {len(clusters)} cluster(s) for {mint}")
+                except Exception as e:
+                    log.error(f"Error scanning {mint}: {e}")
 
-                        for cluster in clusters:
-                            wallet_infos = {}
-                            for entry in cluster["wallets"]:
-                                w = entry["wallet"]
-                                try:
-                                    wallet_infos[w] = await get_wallet_info(client, w)
-                                except Exception as e:
-                                    log.warning(f"Wallet info failed for {w}: {e}")
-                                    wallet_infos[w] = {}
+            LAST_SCAN_TIME = time.time()
 
-                            all_suspicious = all(
-                                is_suspicious_wallet(wallet_infos.get(e["wallet"], {}))
-                                for e in cluster["wallets"]
-                            )
-                            if not all_suspicious:
-                                continue
+        except Exception as e:
+            log.error(f"Scan cycle error: {e}")
 
-                            await send_telegram_alert(app.bot, mint, cluster, wallet_infos)
-
-                        await asyncio.sleep(0.5)
-
-                    except Exception as e:
-                        log.error(f"Error scanning {mint}: {e}")
-
-            except Exception as e:
-                log.error(f"Scan cycle error: {e}")
-
-            log.info(f"Sleeping {POLL_INTERVAL_SECONDS}s...")
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        log.info(f"Sleeping {POLL_INTERVAL_SECONDS}s...")
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +746,8 @@ async def scan_loop(app: Application):
 # ---------------------------------------------------------------------------
 
 async def main():
-    global BOT_START_TIME
+    global BOT_START_TIME, _http_client
+
     log.info("🚀 Pump.fun Coordinated Wallet Scanner starting...")
 
     if not HELIUS_API_KEY or HELIUS_API_KEY == "YOUR_HELIUS_API_KEY":
@@ -367,9 +762,22 @@ async def main():
     log.info(f"Chat ID: {TELEGRAM_CHAT_ID}")
 
     BOT_START_TIME = time.time()
+    load_state()
+    _http_client = httpx.AsyncClient()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("info", cmd_info))
+
+    app.add_handler(CommandHandler("info",        cmd_info))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("threshold",   cmd_threshold))
+    app.add_handler(CommandHandler("minwallets",  cmd_minwallets))
+    app.add_handler(CommandHandler("window",      cmd_window))
+    app.add_handler(CommandHandler("dormantage",  cmd_dormantage))
+    app.add_handler(CommandHandler("wallet",      cmd_wallet))
+    app.add_handler(CommandHandler("token",       cmd_token))
+    app.add_handler(CommandHandler("cluster",     cmd_cluster))
+    app.add_handler(CommandHandler("recent",      cmd_recent))
+    app.add_handler(CommandHandler("stats",       cmd_stats))
 
     async with app:
         await app.start()
@@ -380,19 +788,34 @@ async def main():
                 chat_id=TELEGRAM_CHAT_ID,
                 text=(
                     "✅ *Scanner online.*\n"
-                    "Watching for coordinated accumulation on pump.fun tokens older than 24h.\n\n"
-                    "Commands:\n"
-                    "/info — show current thresholds and stats"
+                    "Watching pump.fun tokens older than 24h for coordinated accumulation.\n"
+                    "\n"
+                    "*Commands*\n"
+                    "/info — thresholds and config\n"
+                    "/status — uptime and scan stats\n"
+                    "/stats — detection totals and hit rate\n"
+                    "/recent — last 10 alerts\n"
+                    "\n"
+                    "/threshold N — set supply % trigger\n"
+                    "/minwallets N — set min wallets in cluster\n"
+                    "/window N — set time window (minutes)\n"
+                    "/dormantage N — set dormant wallet age (days)\n"
+                    "\n"
+                    "/wallet \\<address\\> — profile a wallet\n"
+                    "/token \\<mint\\> — scan suspicious holders\n"
+                    "/cluster \\<mint\\> — show detected clusters"
                 ),
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             log.error(f"Startup message failed: {e}")
 
-        await scan_loop(app)
-
-        await app.updater.stop()
-        await app.stop()
+        try:
+            await scan_loop(app)
+        finally:
+            await _http_client.aclose()
+            await app.updater.stop()
+            await app.stop()
 
 
 if __name__ == "__main__":
