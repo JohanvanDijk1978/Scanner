@@ -2,7 +2,7 @@
 Pump.fun Coordinated Wallet Scanner
 Detects coordinated accumulation by suspicious wallets on older pump.fun tokens.
 
-Commands:
+Commands (all users):
   /info         — current thresholds + live stats
   /status       — uptime, tokens scanned, last scan time
   /threshold N  — set supply % trigger (e.g. /threshold 3)
@@ -14,6 +14,9 @@ Commands:
   /cluster MINT — show all detected clusters for a token
   /recent       — last 10 alerts fired
   /stats        — detection totals and hit rate
+
+Owner only:
+  /users        — see who has interacted with the bot
 """
 
 import asyncio
@@ -65,12 +68,16 @@ state = {
     "max_wallet_age_days": MAX_WALLET_AGE_DAYS,
 }
 
-STATE_FILE = Path("/app/state.json")  # persists on Railway volume; falls back gracefully
+STATE_FILE = Path("/app/state.json")
+USERS_FILE = Path("/app/users.json")
 
 alerted_clusters: dict[str, float] = {}   # cluster_key -> last_alert_timestamp
 known_tokens: dict[str, float] = {}        # mint -> first_seen_timestamp
 token_clusters: dict[str, list] = {}       # mint -> list of detected clusters
 recent_alerts: deque = deque(maxlen=10)    # last 10 alert dicts
+
+# User tracking: {chat_id_str: {username, first_seen, last_seen, command_count, last_command}}
+known_users: dict[str, dict] = {}
 
 BOT_START_TIME: float = 0.0
 LAST_SCAN_TIME: float = 0.0
@@ -93,7 +100,6 @@ def load_state():
     try:
         if STATE_FILE.exists():
             saved = json.loads(STATE_FILE.read_text())
-            # Only load keys that exist in state (ignore unknown/stale keys)
             for k in state:
                 if k in saved:
                     state[k] = saved[k]
@@ -111,6 +117,76 @@ def save_state():
         STATE_FILE.write_text(json.dumps(state, indent=2))
     except Exception as e:
         log.warning(f"Could not save state file: {e}")
+
+
+def load_users():
+    """Load persisted user records from disk."""
+    global known_users
+    try:
+        if USERS_FILE.exists():
+            known_users = json.loads(USERS_FILE.read_text())
+            log.info(f"Loaded {len(known_users)} known users")
+    except Exception as e:
+        log.warning(f"Could not load users file: {e}")
+
+
+def save_users():
+    """Write user records to disk."""
+    try:
+        USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USERS_FILE.write_text(json.dumps(known_users, indent=2))
+    except Exception as e:
+        log.warning(f"Could not save users file: {e}")
+
+
+def is_owner(update: Update) -> bool:
+    return str(update.effective_chat.id) == str(TELEGRAM_CHAT_ID)
+
+
+async def track_user(update: Update, app: Application):
+    """Record every user who interacts with the bot. Alert owner on first contact from strangers."""
+    chat_id = str(update.effective_chat.id)
+    user = update.effective_user
+    username = f"@{user.username}" if user and user.username else (user.full_name if user else "unknown")
+    command = update.message.text.split()[0] if update.message and update.message.text else "unknown"
+    now = time.time()
+
+    is_new = chat_id not in known_users
+
+    if is_new:
+        known_users[chat_id] = {
+            "username": username,
+            "first_seen": now,
+            "last_seen": now,
+            "command_count": 1,
+            "last_command": command,
+        }
+    else:
+        known_users[chat_id]["last_seen"] = now
+        known_users[chat_id]["command_count"] = known_users[chat_id].get("command_count", 0) + 1
+        known_users[chat_id]["last_command"] = command
+        known_users[chat_id]["username"] = username
+
+    save_users()
+
+    # Alert owner when a new non-owner user tries the bot
+    if is_new and not is_owner(update):
+        strangers = sum(1 for uid in known_users if uid != str(TELEGRAM_CHAT_ID))
+        try:
+            await app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    f"👀 *New user found your bot*\n\n"
+                    f"  User: `{username}`\n"
+                    f"  Chat ID: `{chat_id}`\n"
+                    f"  Command: `{command}`\n"
+                    f"  Time: `{datetime.fromtimestamp(now, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                    f"Total non-owner users: `{strangers}`"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            log.warning(f"Could not send new user alert: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -173,12 +249,14 @@ async def get_wallet_info(wallet: str) -> dict:
     sigs_result = await rpc_post("getSignaturesForAddress", [wallet, {"limit": 1000}])
     tx_count = len(sigs_result) if isinstance(sigs_result, list) else 0
     age_days = None
+    first_seen = None
+    last_seen = None
     if isinstance(sigs_result, list) and sigs_result:
         block_time = sigs_result[-1].get("blockTime")
         if block_time:
             age_days = (time.time() - block_time) / 86400
-    first_seen = sigs_result[-1].get("blockTime") if sigs_result else None
-    last_seen = sigs_result[0].get("blockTime") if sigs_result else None
+        first_seen = sigs_result[-1].get("blockTime")
+        last_seen = sigs_result[0].get("blockTime")
     return {
         "address": wallet,
         "tx_count": tx_count,
@@ -186,6 +264,53 @@ async def get_wallet_info(wallet: str) -> dict:
         "first_seen": first_seen,
         "last_seen": last_seen,
     }
+
+
+async def get_wallet_swaps(wallet: str) -> list[dict]:
+    url = (
+        f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+        f"?api-key={HELIUS_API_KEY}&limit=100&type=SWAP"
+    )
+    resp = await _http_client.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def get_wallet_token_balances(wallet: str) -> list[dict]:
+    result = await rpc_post(
+        "getTokenAccountsByOwner",
+        [
+            wallet,
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"},
+        ],
+    )
+    balances = []
+    for acc in result.get("value", []):
+        parsed = acc.get("account", {}).get("data", {}).get("parsed", {})
+        info = parsed.get("info", {})
+        mint = info.get("mint")
+        amount = float(info.get("tokenAmount", {}).get("uiAmount") or 0)
+        if mint and amount > 0:
+            balances.append({"mint": mint, "amount": amount})
+    return balances
+
+
+async def get_jupiter_prices(mints: list[str]) -> dict[str, float]:
+    if not mints:
+        return {}
+    ids = ",".join(mints[:100])
+    try:
+        resp = await _http_client.get(
+            f"https://price.jup.ag/v6/price?ids={ids}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        return {mint: data[mint]["price"] for mint in data if "price" in data[mint]}
+    except Exception as e:
+        log.warning(f"Jupiter price fetch failed: {e}")
+        return {}
 
 
 def is_suspicious_wallet(wallet_info: dict) -> bool:
@@ -206,6 +331,82 @@ def wallet_label(wallet_info: dict) -> str:
     if age_days is not None and age_days > state["max_wallet_age_days"]:
         return "💤 Dormant"
     return "⚠️ Low-activity"
+
+
+def parse_trade_pnl(txs: list[dict], wallet: str) -> dict:
+    """Parse swap history to compute win rate, best PnL, open positions."""
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    token_flows: dict[str, dict] = {}
+
+    for tx in txs:
+        transfers = tx.get("tokenTransfers", [])
+        native = tx.get("nativeTransfers", [])
+
+        sol_spent = sum(
+            t.get("amount", 0) / 1e9
+            for t in native
+            if t.get("fromUserAccount") == wallet
+        )
+        sol_received = sum(
+            t.get("amount", 0) / 1e9
+            for t in native
+            if t.get("toUserAccount") == wallet
+        )
+
+        for t in transfers:
+            mint = t.get("mint")
+            if not mint or mint == SOL_MINT:
+                continue
+            if mint not in token_flows:
+                token_flows[mint] = {"sol_in": 0, "sol_out": 0, "token_in": 0, "token_out": 0}
+
+            amount = int(t.get("tokenAmount", 0))
+            if t.get("toUserAccount") == wallet:
+                token_flows[mint]["token_in"] += amount
+                token_flows[mint]["sol_in"] += sol_spent
+            elif t.get("fromUserAccount") == wallet:
+                token_flows[mint]["token_out"] += amount
+                token_flows[mint]["sol_out"] += sol_received
+
+    trades = []
+    open_positions = {}
+
+    for mint, flow in token_flows.items():
+        if flow["sol_in"] == 0:
+            continue
+        has_sold = flow["sol_out"] > 0
+        pnl_sol = flow["sol_out"] - flow["sol_in"]
+        if has_sold:
+            trades.append({
+                "mint": mint,
+                "sol_in": flow["sol_in"],
+                "sol_out": flow["sol_out"],
+                "pnl_sol": pnl_sol,
+                "won": pnl_sol > 0,
+            })
+        if flow["token_in"] > flow["token_out"]:
+            open_positions[mint] = {
+                "mint": mint,
+                "token_balance": flow["token_in"] - flow["token_out"],
+                "sol_invested": flow["sol_in"],
+                "sol_recovered": flow["sol_out"],
+            }
+
+    wins = sum(1 for t in trades if t["won"])
+    total_closed = len(trades)
+    win_rate = (wins / total_closed * 100) if total_closed > 0 else None
+    best_trade = max(trades, key=lambda t: t["pnl_sol"]) if trades else None
+    worst_trade = min(trades, key=lambda t: t["pnl_sol"]) if trades else None
+
+    return {
+        "trades": trades,
+        "win_rate": win_rate,
+        "total_closed": total_closed,
+        "wins": wins,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "open_positions": open_positions,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -327,21 +528,17 @@ async def send_telegram_alert(bot: Bot, mint: str, cluster: dict, wallet_infos: 
             f"— {tx_count} txs, {age_str}, {individual_pct:.2f}% supply"
         )
 
-    msg = "\n".join(lines)
-
-    # Store in recent alerts
     recent_alerts.appendleft({
         "mint": mint,
         "pct": pct,
         "n_wallets": n,
         "timestamp": now,
-        "msg_preview": f"{n} wallets, {pct:.2f}% supply",
     })
 
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
+            text="\n".join(lines),
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
@@ -362,7 +559,7 @@ def fmt_uptime() -> str:
 
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/info — thresholds + live stats."""
+    await track_user(update, context.application)
     s = state
     msg = (
         "ℹ️ *Scanner Info*\n"
@@ -395,7 +592,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/status — uptime, scan counts, last scan time."""
+    await track_user(update, context.application)
     last_scan = (
         datetime.fromtimestamp(LAST_SCAN_TIME, tz=timezone.utc).strftime("%H:%M:%S UTC")
         if LAST_SCAN_TIME else "not yet"
@@ -416,7 +613,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/threshold N — set supply % trigger."""
+    await track_user(update, context.application)
     try:
         val = float(context.args[0])
         assert 0.1 <= val <= 100
@@ -432,7 +629,7 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_minwallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/minwallets N — set minimum coordinated wallets."""
+    await track_user(update, context.application)
     try:
         val = int(context.args[0])
         assert 2 <= val <= 20
@@ -448,7 +645,7 @@ async def cmd_minwallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/window N — set time window in minutes."""
+    await track_user(update, context.application)
     try:
         val = int(context.args[0])
         assert 1 <= val <= 60
@@ -464,7 +661,7 @@ async def cmd_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_dormantage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/dormantage N — set dormant wallet age threshold in days."""
+    await track_user(update, context.application)
     try:
         val = int(context.args[0])
         assert 1 <= val <= 3650
@@ -479,150 +676,8 @@ async def cmd_dormantage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def get_wallet_swaps(wallet: str) -> list[dict]:
-    """Fetch parsed swap transactions for a wallet via Helius."""
-    url = (
-        f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
-        f"?api-key={HELIUS_API_KEY}&limit=100&type=SWAP"
-    )
-    resp = await _http_client.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def get_jupiter_prices(mints: list[str]) -> dict[str, float]:
-    """Fetch current USD prices for a list of mints from Jupiter."""
-    if not mints:
-        return {}
-    ids = ",".join(mints[:100])
-    try:
-        resp = await _http_client.get(
-            f"https://price.jup.ag/v6/price?ids={ids}",
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        return {mint: data[mint]["price"] for mint in data if "price" in data[mint]}
-    except Exception as e:
-        log.warning(f"Jupiter price fetch failed: {e}")
-        return {}
-
-
-async def get_wallet_token_balances(wallet: str) -> list[dict]:
-    """Fetch current SPL token balances for a wallet."""
-    result = await rpc_post(
-        "getTokenAccountsByOwner",
-        [
-            wallet,
-            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-            {"encoding": "jsonParsed"},
-        ],
-    )
-    balances = []
-    for acc in result.get("value", []):
-        parsed = acc.get("account", {}).get("data", {}).get("parsed", {})
-        info = parsed.get("info", {})
-        mint = info.get("mint")
-        amount = float(info.get("tokenAmount", {}).get("uiAmount") or 0)
-        if mint and amount > 0:
-            balances.append({"mint": mint, "amount": amount})
-    return balances
-
-
-def parse_trade_pnl(txs: list[dict], wallet: str) -> dict:
-    """
-    Parse swap history to compute:
-    - Win rate (trades where SOL out > SOL in)
-    - Biggest single-trade PnL in SOL
-    - Per-token net SOL flows (for open position detection)
-    """
-    # Track SOL flow per token: {mint: {"sol_in": X, "sol_out": Y, "token_in": A, "token_out": B}}
-    token_flows: dict[str, dict] = {}
-    SOL_MINT = "So11111111111111111111111111111111111111112"
-
-    for tx in txs:
-        transfers = tx.get("tokenTransfers", [])
-        native = tx.get("nativeTransfers", [])
-
-        # Find SOL moved by this wallet
-        sol_spent = sum(
-            t.get("amount", 0) / 1e9
-            for t in native
-            if t.get("fromUserAccount") == wallet
-        )
-        sol_received = sum(
-            t.get("amount", 0) / 1e9
-            for t in native
-            if t.get("toUserAccount") == wallet
-        )
-
-        # Find tokens received and sent by this wallet (excluding SOL mint)
-        for t in transfers:
-            mint = t.get("mint")
-            if not mint or mint == SOL_MINT:
-                continue
-            if mint not in token_flows:
-                token_flows[mint] = {"sol_in": 0, "sol_out": 0, "token_in": 0, "token_out": 0}
-
-            amount = int(t.get("tokenAmount", 0))
-            if t.get("toUserAccount") == wallet:
-                # Received token = bought with SOL
-                token_flows[mint]["token_in"] += amount
-                token_flows[mint]["sol_in"] += sol_spent
-            elif t.get("fromUserAccount") == wallet:
-                # Sent token = sold for SOL
-                token_flows[mint]["token_out"] += amount
-                token_flows[mint]["sol_out"] += sol_received
-
-    # Calculate PnL per token (only for tokens with both buy and sell activity = closed/partial)
-    trades = []
-    open_positions = {}
-
-    for mint, flow in token_flows.items():
-        if flow["sol_in"] == 0:
-            continue
-
-        has_sold = flow["sol_out"] > 0
-        pnl_sol = flow["sol_out"] - flow["sol_in"]
-
-        if has_sold:
-            trades.append({
-                "mint": mint,
-                "sol_in": flow["sol_in"],
-                "sol_out": flow["sol_out"],
-                "pnl_sol": pnl_sol,
-                "won": pnl_sol > 0,
-            })
-
-        # Still holding tokens = open position
-        if flow["token_in"] > flow["token_out"]:
-            open_positions[mint] = {
-                "mint": mint,
-                "token_balance": flow["token_in"] - flow["token_out"],
-                "sol_invested": flow["sol_in"],
-                "sol_recovered": flow["sol_out"],
-            }
-
-    wins = sum(1 for t in trades if t["won"])
-    total_closed = len(trades)
-    win_rate = (wins / total_closed * 100) if total_closed > 0 else None
-
-    best_trade = max(trades, key=lambda t: t["pnl_sol"]) if trades else None
-    worst_trade = min(trades, key=lambda t: t["pnl_sol"]) if trades else None
-
-    return {
-        "trades": trades,
-        "win_rate": win_rate,
-        "total_closed": total_closed,
-        "wins": wins,
-        "best_trade": best_trade,
-        "worst_trade": worst_trade,
-        "open_positions": open_positions,
-    }
-
-
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/wallet ADDR — full profile with win rate, best PnL, open positions."""
+    await track_user(update, context.application)
     if not context.args:
         await update.message.reply_text("Usage: `/wallet <solana_address>`", parse_mode=ParseMode.MARKDOWN)
         return
@@ -633,7 +688,6 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Fetch all data concurrently
     try:
         info, swaps, balances = await asyncio.gather(
             get_wallet_info(addr),
@@ -644,16 +698,13 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error fetching wallet data: {e}")
         return
 
-    # Parse trading stats
     trading = parse_trade_pnl(swaps, addr)
 
-    # Get current prices for open positions + live balances
     open_mints = list(trading["open_positions"].keys())
-    live_mints = [b["mint"] for b in balances[:10]]  # cap to avoid huge API call
+    live_mints = [b["mint"] for b in balances[:10]]
     all_mints = list(set(open_mints + live_mints))
     prices = await get_jupiter_prices(all_mints) if all_mints else {}
 
-    # --- Format message ---
     tx_count = info.get("tx_count", 0)
     age_days = info.get("age_days")
     first_seen = info.get("first_seen")
@@ -682,7 +733,6 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Last tx: `{last_str}`",
     ]
 
-    # Trading stats
     win_rate = trading["win_rate"]
     total_closed = trading["total_closed"]
     wins = trading["wins"]
@@ -696,7 +746,6 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         wr_str = f"{win_rate:.1f}%" if win_rate is not None else "n/a"
         lines.append(f"  Win rate: `{wr_str}` ({wins}W / {total_closed - wins}L of {total_closed} trades)")
-
         if best:
             sign = "+" if best["pnl_sol"] >= 0 else ""
             lines.append(
@@ -708,34 +757,27 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  Worst trade: `{worst['pnl_sol']:.3f} SOL` "
                 f"([`{worst['mint'][:6]}…`](https://solscan.io/token/{worst['mint']}))"
             )
-
         total_pnl = sum(t["pnl_sol"] for t in trading["trades"])
         sign = "+" if total_pnl >= 0 else ""
         lines.append(f"  Total realised PnL: `{sign}{total_pnl:.3f} SOL`")
 
-    # Open positions (from swap history)
     open_pos = trading["open_positions"]
     if open_pos:
         lines += ["", "*Open Positions* (from swap history)"]
         for mint, pos in list(open_pos.items())[:5]:
             price_usd = prices.get(mint)
-            token_bal = pos["token_balance"]
             sol_in = pos["sol_invested"]
             sol_out = pos["sol_recovered"]
-            unrealised_str = ""
-            if price_usd:
-                val_usd = token_bal * price_usd / 1e6  # adjust for decimals (rough)
-                unrealised_str = f" ≈ ${val_usd:.2f}"
+            token_bal = pos["token_balance"]
+            unrealised_str = f" ≈ ${token_bal * price_usd / 1e6:.2f}" if price_usd else ""
             lines.append(
                 f"  [`{mint[:6]}…`](https://solscan.io/token/{mint}) "
                 f"— {sol_in:.3f} SOL in, {sol_out:.3f} SOL out{unrealised_str}"
             )
 
-    # Live token balances with USD value
     if balances:
         lines += ["", "*Current Token Holdings*"]
-        shown = 0
-        for b in balances:
+        for i, b in enumerate(balances[:5]):
             mint = b["mint"]
             amount = b["amount"]
             price_usd = prices.get(mint)
@@ -744,12 +786,8 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  [`{mint[:6]}…`](https://solscan.io/token/{mint}) "
                 f"— {amount:,.0f} tokens{val_str}"
             )
-            shown += 1
-            if shown >= 5:
-                remaining = len(balances) - shown
-                if remaining > 0:
-                    lines.append(f"  _…and {remaining} more_")
-                break
+        if len(balances) > 5:
+            lines.append(f"  _…and {len(balances) - 5} more_")
 
     lines.append(f"\n[View on Solscan](https://solscan.io/account/{addr})")
 
@@ -760,9 +798,8 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-
 async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/token MINT — show suspicious wallets currently holding this token."""
+    await track_user(update, context.application)
     if not context.args:
         await update.message.reply_text("Usage: `/token <mint_address>`", parse_mode=ParseMode.MARKDOWN)
         return
@@ -782,15 +819,13 @@ async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No recent buy activity found for this token.")
         return
 
-    # Get unique buyers and check them
     unique_wallets = list({b["wallet"] for b in buys})
     suspicious_found = []
 
-    for w in unique_wallets[:20]:  # cap at 20 to avoid rate limit hammering
+    for w in unique_wallets[:20]:
         try:
             info = await get_wallet_info(w)
             if is_suspicious_wallet(info):
-                # Sum their total buys
                 total_bought = sum(b["amount"] for b in buys if b["wallet"] == w)
                 pct = (total_bought / supply * 100) if supply else 0
                 suspicious_found.append({"info": info, "wallet": w, "pct": pct})
@@ -827,7 +862,7 @@ async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cluster(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cluster MINT — show all detected clusters for a token."""
+    await track_user(update, context.application)
     if not context.args:
         await update.message.reply_text("Usage: `/cluster <mint_address>`", parse_mode=ParseMode.MARKDOWN)
         return
@@ -860,7 +895,7 @@ async def cmd_cluster(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/recent — last 10 alerts fired."""
+    await track_user(update, context.application)
     if not recent_alerts:
         await update.message.reply_text("No alerts fired yet this session.")
         return
@@ -880,7 +915,7 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stats — detection totals and hit rate."""
+    await track_user(update, context.application)
     hit_rate = (
         f"{(TOTAL_CLUSTERS_FOUND / TOTAL_TOKENS_SCANNED * 100):.1f}%"
         if TOTAL_TOKENS_SCANNED > 0 else "n/a"
@@ -904,6 +939,42 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Uptime: `{fmt_uptime()}`\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/users — owner only: see who has interacted with the bot."""
+    await track_user(update, context.application)
+
+    if not is_owner(update):
+        return  # silently ignore non-owners
+
+    owner_id = str(TELEGRAM_CHAT_ID)
+    strangers = {uid: u for uid, u in known_users.items() if uid != owner_id}
+
+    lines = [
+        "👥 *User Activity*\n",
+        f"Total unique visitors: `{len(known_users)}`",
+        f"Non-owner attempts: `{len(strangers)}`\n",
+    ]
+
+    if not strangers:
+        lines.append("No unauthorised users have tried the bot yet.")
+    else:
+        lines.append("*Unauthorised users:*")
+        for uid, u in sorted(strangers.items(), key=lambda x: x[1].get("last_seen", 0), reverse=True):
+            first = datetime.fromtimestamp(u["first_seen"], tz=timezone.utc).strftime("%m/%d %H:%M")
+            last = datetime.fromtimestamp(u["last_seen"], tz=timezone.utc).strftime("%m/%d %H:%M")
+            count = u.get("command_count", 1)
+            last_cmd = u.get("last_command", "?")
+            lines.append(
+                f"\n  `{u['username']}` (ID: `{uid}`)\n"
+                f"  {count} attempt(s) | first: {first} | last: {last}\n"
+                f"  Last command: `{last_cmd}`"
+            )
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -938,7 +1009,6 @@ async def scan_loop(app: Application):
                     TOTAL_CLUSTERS_FOUND += len(clusters)
                     log.info(f"Found {len(clusters)} cluster(s) for {mint}")
 
-                    # Store clusters for /cluster command
                     token_clusters[mint] = clusters
 
                     for cluster in clusters:
@@ -996,6 +1066,7 @@ async def main():
 
     BOT_START_TIME = time.time()
     load_state()
+    load_users()
     _http_client = httpx.AsyncClient()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -1011,6 +1082,7 @@ async def main():
     app.add_handler(CommandHandler("cluster",     cmd_cluster))
     app.add_handler(CommandHandler("recent",      cmd_recent))
     app.add_handler(CommandHandler("stats",       cmd_stats))
+    app.add_handler(CommandHandler("users",       cmd_users))
 
     async with app:
         await app.start()
@@ -1036,7 +1108,8 @@ async def main():
                     "\n"
                     "/wallet \\<address\\> — profile a wallet\n"
                     "/token \\<mint\\> — scan suspicious holders\n"
-                    "/cluster \\<mint\\> — show detected clusters"
+                    "/cluster \\<mint\\> — show detected clusters\n"
+                    "/users — see who has used the bot \\(owner only\\)"
                 ),
                 parse_mode=ParseMode.MARKDOWN,
             )
