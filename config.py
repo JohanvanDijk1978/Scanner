@@ -8,9 +8,9 @@ import os
 # ---------------------------------------------------------------------------
 # Required credentials — set as environment variables on Railway
 # ---------------------------------------------------------------------------
-HELIUS_API_KEY = os.environ.get("915dd768-93a2-44dc-9577-32d6cc548601")
-TELEGRAM_BOT_TOKEN = os.environ.get("8628775758:AAFcoDK0RBdeUfzOo85EoeZMlpGdPLHWa2g")
-TELEGRAM_CHAT_ID = os.environ.get("931860098", "1768528319")
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "915dd768-93a2-44dc-9577-32d6cc548601")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8628775758:AAH76VBVEHvxV2lw2nqG-qAHgW9YDTIp8yg")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1768528319")
 
 # ---------------------------------------------------------------------------
 # Detection thresholds — tune these to reduce noise or catch more signals
