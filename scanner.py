@@ -479,21 +479,181 @@ async def cmd_dormantage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def get_wallet_swaps(wallet: str) -> list[dict]:
+    """Fetch parsed swap transactions for a wallet via Helius."""
+    url = (
+        f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+        f"?api-key={HELIUS_API_KEY}&limit=100&type=SWAP"
+    )
+    resp = await _http_client.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def get_jupiter_prices(mints: list[str]) -> dict[str, float]:
+    """Fetch current USD prices for a list of mints from Jupiter."""
+    if not mints:
+        return {}
+    ids = ",".join(mints[:100])
+    try:
+        resp = await _http_client.get(
+            f"https://price.jup.ag/v6/price?ids={ids}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        return {mint: data[mint]["price"] for mint in data if "price" in data[mint]}
+    except Exception as e:
+        log.warning(f"Jupiter price fetch failed: {e}")
+        return {}
+
+
+async def get_wallet_token_balances(wallet: str) -> list[dict]:
+    """Fetch current SPL token balances for a wallet."""
+    result = await rpc_post(
+        "getTokenAccountsByOwner",
+        [
+            wallet,
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"},
+        ],
+    )
+    balances = []
+    for acc in result.get("value", []):
+        parsed = acc.get("account", {}).get("data", {}).get("parsed", {})
+        info = parsed.get("info", {})
+        mint = info.get("mint")
+        amount = float(info.get("tokenAmount", {}).get("uiAmount") or 0)
+        if mint and amount > 0:
+            balances.append({"mint": mint, "amount": amount})
+    return balances
+
+
+def parse_trade_pnl(txs: list[dict], wallet: str) -> dict:
+    """
+    Parse swap history to compute:
+    - Win rate (trades where SOL out > SOL in)
+    - Biggest single-trade PnL in SOL
+    - Per-token net SOL flows (for open position detection)
+    """
+    # Track SOL flow per token: {mint: {"sol_in": X, "sol_out": Y, "token_in": A, "token_out": B}}
+    token_flows: dict[str, dict] = {}
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+
+    for tx in txs:
+        transfers = tx.get("tokenTransfers", [])
+        native = tx.get("nativeTransfers", [])
+
+        # Find SOL moved by this wallet
+        sol_spent = sum(
+            t.get("amount", 0) / 1e9
+            for t in native
+            if t.get("fromUserAccount") == wallet
+        )
+        sol_received = sum(
+            t.get("amount", 0) / 1e9
+            for t in native
+            if t.get("toUserAccount") == wallet
+        )
+
+        # Find tokens received and sent by this wallet (excluding SOL mint)
+        for t in transfers:
+            mint = t.get("mint")
+            if not mint or mint == SOL_MINT:
+                continue
+            if mint not in token_flows:
+                token_flows[mint] = {"sol_in": 0, "sol_out": 0, "token_in": 0, "token_out": 0}
+
+            amount = int(t.get("tokenAmount", 0))
+            if t.get("toUserAccount") == wallet:
+                # Received token = bought with SOL
+                token_flows[mint]["token_in"] += amount
+                token_flows[mint]["sol_in"] += sol_spent
+            elif t.get("fromUserAccount") == wallet:
+                # Sent token = sold for SOL
+                token_flows[mint]["token_out"] += amount
+                token_flows[mint]["sol_out"] += sol_received
+
+    # Calculate PnL per token (only for tokens with both buy and sell activity = closed/partial)
+    trades = []
+    open_positions = {}
+
+    for mint, flow in token_flows.items():
+        if flow["sol_in"] == 0:
+            continue
+
+        has_sold = flow["sol_out"] > 0
+        pnl_sol = flow["sol_out"] - flow["sol_in"]
+
+        if has_sold:
+            trades.append({
+                "mint": mint,
+                "sol_in": flow["sol_in"],
+                "sol_out": flow["sol_out"],
+                "pnl_sol": pnl_sol,
+                "won": pnl_sol > 0,
+            })
+
+        # Still holding tokens = open position
+        if flow["token_in"] > flow["token_out"]:
+            open_positions[mint] = {
+                "mint": mint,
+                "token_balance": flow["token_in"] - flow["token_out"],
+                "sol_invested": flow["sol_in"],
+                "sol_recovered": flow["sol_out"],
+            }
+
+    wins = sum(1 for t in trades if t["won"])
+    total_closed = len(trades)
+    win_rate = (wins / total_closed * 100) if total_closed > 0 else None
+
+    best_trade = max(trades, key=lambda t: t["pnl_sol"]) if trades else None
+    worst_trade = min(trades, key=lambda t: t["pnl_sol"]) if trades else None
+
+    return {
+        "trades": trades,
+        "win_rate": win_rate,
+        "total_closed": total_closed,
+        "wins": wins,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "open_positions": open_positions,
+    }
+
+
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/wallet ADDR — full profile of a wallet."""
+    """/wallet ADDR — full profile with win rate, best PnL, open positions."""
     if not context.args:
         await update.message.reply_text("Usage: `/wallet <solana_address>`", parse_mode=ParseMode.MARKDOWN)
         return
 
     addr = context.args[0].strip()
-    await update.message.reply_text(f"🔍 Looking up `{addr[:8]}…`", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"🔍 Pulling full profile for `{addr[:8]}…` — this takes a few seconds…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
+    # Fetch all data concurrently
     try:
-        info = await get_wallet_info(addr)
+        info, swaps, balances = await asyncio.gather(
+            get_wallet_info(addr),
+            get_wallet_swaps(addr),
+            get_wallet_token_balances(addr),
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Error fetching wallet: {e}")
+        await update.message.reply_text(f"❌ Error fetching wallet data: {e}")
         return
 
+    # Parse trading stats
+    trading = parse_trade_pnl(swaps, addr)
+
+    # Get current prices for open positions + live balances
+    open_mints = list(trading["open_positions"].keys())
+    live_mints = [b["mint"] for b in balances[:10]]  # cap to avoid huge API call
+    all_mints = list(set(open_mints + live_mints))
+    prices = await get_jupiter_prices(all_mints) if all_mints else {}
+
+    # --- Format message ---
     tx_count = info.get("tx_count", 0)
     age_days = info.get("age_days")
     first_seen = info.get("first_seen")
@@ -501,7 +661,7 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     suspicious = is_suspicious_wallet(info)
     label = wallet_label(info)
 
-    age_str = f"{age_days:.0f} days" if age_days is not None else "unknown"
+    age_str = f"{age_days:.0f}d" if age_days is not None else "unknown"
     first_str = (
         datetime.fromtimestamp(first_seen, tz=timezone.utc).strftime("%Y-%m-%d")
         if first_seen else "unknown"
@@ -511,21 +671,94 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if last_seen else "unknown"
     )
 
-    msg = (
-        f"👛 *Wallet Profile*\n"
-        f"\n"
-        f"  Address: [`{addr[:6]}…{addr[-4:]}`](https://solscan.io/account/{addr})\n"
-        f"  Classification: {label}\n"
-        f"  Suspicious: `{'Yes ⚠️' if suspicious else 'No ✅'}`\n"
-        f"\n"
-        f"  Total txs: `{tx_count}`\n"
-        f"  Wallet age: `{age_str}`\n"
-        f"  First tx: `{first_str}`\n"
-        f"  Last tx: `{last_str}`\n"
-        f"\n"
-        f"  [View on Solscan](https://solscan.io/account/{addr})"
+    lines = [
+        f"👛 *Wallet Profile*",
+        f"[`{addr[:6]}…{addr[-4:]}`](https://solscan.io/account/{addr})",
+        f"",
+        f"*Identity*",
+        f"  Classification: {label} {'⚠️' if suspicious else '✅'}",
+        f"  Age: `{age_str}` | Txs: `{tx_count}`",
+        f"  First tx: `{first_str}`",
+        f"  Last tx: `{last_str}`",
+    ]
+
+    # Trading stats
+    win_rate = trading["win_rate"]
+    total_closed = trading["total_closed"]
+    wins = trading["wins"]
+    best = trading["best_trade"]
+    worst = trading["worst_trade"]
+
+    lines += ["", "*Trading Stats* (last 100 swaps)"]
+
+    if total_closed == 0:
+        lines.append("  No closed trades found in recent history")
+    else:
+        wr_str = f"{win_rate:.1f}%" if win_rate is not None else "n/a"
+        lines.append(f"  Win rate: `{wr_str}` ({wins}W / {total_closed - wins}L of {total_closed} trades)")
+
+        if best:
+            sign = "+" if best["pnl_sol"] >= 0 else ""
+            lines.append(
+                f"  Best trade: `{sign}{best['pnl_sol']:.3f} SOL` "
+                f"([`{best['mint'][:6]}…`](https://solscan.io/token/{best['mint']}))"
+            )
+        if worst and worst["mint"] != (best["mint"] if best else None):
+            lines.append(
+                f"  Worst trade: `{worst['pnl_sol']:.3f} SOL` "
+                f"([`{worst['mint'][:6]}…`](https://solscan.io/token/{worst['mint']}))"
+            )
+
+        total_pnl = sum(t["pnl_sol"] for t in trading["trades"])
+        sign = "+" if total_pnl >= 0 else ""
+        lines.append(f"  Total realised PnL: `{sign}{total_pnl:.3f} SOL`")
+
+    # Open positions (from swap history)
+    open_pos = trading["open_positions"]
+    if open_pos:
+        lines += ["", "*Open Positions* (from swap history)"]
+        for mint, pos in list(open_pos.items())[:5]:
+            price_usd = prices.get(mint)
+            token_bal = pos["token_balance"]
+            sol_in = pos["sol_invested"]
+            sol_out = pos["sol_recovered"]
+            unrealised_str = ""
+            if price_usd:
+                val_usd = token_bal * price_usd / 1e6  # adjust for decimals (rough)
+                unrealised_str = f" ≈ ${val_usd:.2f}"
+            lines.append(
+                f"  [`{mint[:6]}…`](https://solscan.io/token/{mint}) "
+                f"— {sol_in:.3f} SOL in, {sol_out:.3f} SOL out{unrealised_str}"
+            )
+
+    # Live token balances with USD value
+    if balances:
+        lines += ["", "*Current Token Holdings*"]
+        shown = 0
+        for b in balances:
+            mint = b["mint"]
+            amount = b["amount"]
+            price_usd = prices.get(mint)
+            val_str = f" ≈ ${amount * price_usd:.2f}" if price_usd else ""
+            lines.append(
+                f"  [`{mint[:6]}…`](https://solscan.io/token/{mint}) "
+                f"— {amount:,.0f} tokens{val_str}"
+            )
+            shown += 1
+            if shown >= 5:
+                remaining = len(balances) - shown
+                if remaining > 0:
+                    lines.append(f"  _…and {remaining} more_")
+                break
+
+    lines.append(f"\n[View on Solscan](https://solscan.io/account/{addr})")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
 
 
 async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
