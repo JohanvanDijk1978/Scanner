@@ -8,9 +8,9 @@ import os
 # ---------------------------------------------------------------------------
 # Required credentials
 # ---------------------------------------------------------------------------
-HELIUS_API_KEY     = os.environ.get("HELIUS_API_KEY", "YOUR_HELIUS_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "915dd768-93a2-44dc-9577-32d6cc548601")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8628775758:AAH76VBVEHvxV2lw2nqG-qAHgW9YDTIp8yg")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1768528319")
 
 # Your Railway public URL — e.g. https://yourapp.up.railway.app
 # Find it in Railway: your service → Settings → Networking → Public URL
