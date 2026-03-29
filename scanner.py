@@ -234,7 +234,9 @@ async def get_wallet_swaps(wallet: str) -> list[dict]:
     )
     resp = await _http_client.get(url, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    txs = resp.json()
+    # Attach timestamps clearly for time-window filtering
+    return txs
 
 
 async def get_wallet_token_balances(wallet: str) -> list[dict]:
@@ -340,11 +342,19 @@ def wallet_label(wallet_info: dict) -> str:
     return "⚠️ Low-activity"
 
 
-def parse_trade_pnl(txs: list[dict], wallet: str) -> dict:
+def parse_trade_pnl(txs: list[dict], wallet: str, since: float | None = None) -> dict:
+    """
+    Parse swap history to compute win rate, best/worst trade, open positions.
+    If `since` is provided (unix timestamp), only include transactions after that time.
+    """
     SOL_MINT = "So11111111111111111111111111111111111111112"
     token_flows: dict[str, dict] = {}
 
     for tx in txs:
+        ts = tx.get("timestamp", 0)
+        if since is not None and ts < since:
+            continue
+
         native = tx.get("nativeTransfers", [])
         sol_spent = sum(t.get("amount", 0) / 1e9 for t in native if t.get("fromUserAccount") == wallet)
         sol_received = sum(t.get("amount", 0) / 1e9 for t in native if t.get("toUserAccount") == wallet)
@@ -370,9 +380,20 @@ def parse_trade_pnl(txs: list[dict], wallet: str) -> dict:
             continue
         pnl_sol = flow["sol_out"] - flow["sol_in"]
         if flow["sol_out"] > 0:
-            trades.append({"mint": mint, "sol_in": flow["sol_in"], "sol_out": flow["sol_out"], "pnl_sol": pnl_sol, "won": pnl_sol > 0})
+            trades.append({
+                "mint": mint,
+                "sol_in": flow["sol_in"],
+                "sol_out": flow["sol_out"],
+                "pnl_sol": pnl_sol,
+                "won": pnl_sol > 0,
+            })
         if flow["token_in"] > flow["token_out"]:
-            open_positions[mint] = {"mint": mint, "token_balance": flow["token_in"] - flow["token_out"], "sol_invested": flow["sol_in"], "sol_recovered": flow["sol_out"]}
+            open_positions[mint] = {
+                "mint": mint,
+                "token_balance": flow["token_in"] - flow["token_out"],
+                "sol_invested": flow["sol_in"],
+                "sol_recovered": flow["sol_out"],
+            }
 
     wins = sum(1 for t in trades if t["won"])
     total_closed = len(trades)
@@ -745,8 +766,11 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error fetching wallet data: {e}")
         return
 
-    trading = parse_trade_pnl(swaps, addr)
-    all_mints = list(set(list(trading["open_positions"].keys()) + [b["mint"] for b in balances[:10]]))
+    trading_all  = parse_trade_pnl(swaps, addr)
+    trading_30d  = parse_trade_pnl(swaps, addr, since=time.time() - 86400 * 30)
+    trading_24h  = parse_trade_pnl(swaps, addr, since=time.time() - 86400)
+
+    all_mints = list(set(list(trading_all["open_positions"].keys()) + [b["mint"] for b in balances[:10]]))
     prices = await get_jupiter_prices(all_mints) if all_mints else {}
 
     tx_count = info.get("tx_count", 0)
@@ -766,29 +790,36 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Txs: `{tx_count}`",
         f"  First tx: `{datetime.fromtimestamp(first_seen, tz=timezone.utc).strftime('%Y-%m-%d') if first_seen else 'unknown'}`",
         f"  Last tx: `{datetime.fromtimestamp(last_seen, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if last_seen else 'unknown'}`",
+        f"",
+        f"*Trading Stats*",
     ]
 
-    lines += ["", "*Trading Stats* (last 100 swaps)"]
-    total_closed = trading["total_closed"]
-    if total_closed == 0:
-        lines.append("  No closed trades found in recent history")
-    else:
-        wr = trading["win_rate"]
-        wins = trading["wins"]
-        lines.append(f"  Win rate: `{wr:.1f}%` ({wins}W / {total_closed - wins}L of {total_closed} trades)")
-        if trading["best_trade"]:
-            b = trading["best_trade"]
-            sign = "+" if b["pnl_sol"] >= 0 else ""
-            lines.append(f"  Best trade: `{sign}{b['pnl_sol']:.3f} SOL` ([`{b['mint'][:6]}…`](https://solscan.io/token/{b['mint']}))")
-        if trading["worst_trade"] and trading["worst_trade"]["mint"] != (trading["best_trade"]["mint"] if trading["best_trade"] else None):
-            w = trading["worst_trade"]
-            lines.append(f"  Worst trade: `{w['pnl_sol']:.3f} SOL` ([`{w['mint'][:6]}…`](https://solscan.io/token/{w['mint']}))")
-        total_pnl = sum(t["pnl_sol"] for t in trading["trades"])
-        lines.append(f"  Total realised PnL: `{'+' if total_pnl >= 0 else ''}{total_pnl:.3f} SOL`")
+    def fmt_window(label: str, t: dict) -> str:
+        if t["total_closed"] == 0:
+            return f"  {label}: `no closed trades`"
+        wr = t["win_rate"]
+        wins = t["wins"]
+        total = t["total_closed"]
+        pnl = sum(tr["pnl_sol"] for tr in t["trades"])
+        sign = "+" if pnl >= 0 else ""
+        return f"  {label}: `{wr:.1f}%` ({wins}W/{total - wins}L) — PnL: `{sign}{pnl:.3f} SOL`"
 
-    if trading["open_positions"]:
+    lines.append(fmt_window("Last 24h ", trading_24h))
+    lines.append(fmt_window("Last 30d ", trading_30d))
+    lines.append(fmt_window("All-time ", trading_all))
+
+    # Best and worst from all-time
+    if trading_all["best_trade"]:
+        b = trading_all["best_trade"]
+        sign = "+" if b["pnl_sol"] >= 0 else ""
+        lines.append(f"  Best trade: `{sign}{b['pnl_sol']:.3f} SOL` ([`{b['mint'][:6]}…`](https://solscan.io/token/{b['mint']}))")
+    if trading_all["worst_trade"] and trading_all["worst_trade"]["mint"] != (trading_all["best_trade"]["mint"] if trading_all["best_trade"] else None):
+        w = trading_all["worst_trade"]
+        lines.append(f"  Worst trade: `{w['pnl_sol']:.3f} SOL` ([`{w['mint'][:6]}…`](https://solscan.io/token/{w['mint']}))")
+
+    if trading_all["open_positions"]:
         lines += ["", "*Open Positions*"]
-        for mint, pos in list(trading["open_positions"].items())[:5]:
+        for mint, pos in list(trading_all["open_positions"].items())[:5]:
             price_usd = prices.get(mint)
             unrealised = f" ≈ ${pos['token_balance'] * price_usd / 1e6:.2f}" if price_usd else ""
             lines.append(f"  [`{mint[:6]}…`](https://solscan.io/token/{mint}) — {pos['sol_invested']:.3f} SOL in, {pos['sol_recovered']:.3f} SOL out{unrealised}")
